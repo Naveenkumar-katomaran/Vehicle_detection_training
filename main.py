@@ -4,26 +4,79 @@ import torch
 from ultralytics import YOLO
 import os
 from datetime import datetime
+import threading
+import time
+import queue
+import logging
 from utils.tracker import PlateTracker
 
-def load_config(config_path='config.json'):
-    with open(config_path, 'r') as f:
-        return json.load(f)
+# Global dictionary to store latest frames
+preview_frames = {}
+preview_lock = threading.Lock()
+running = True
 
-def save_training_data(frame, visible_objects, vehicle_classes, frame_count):
-    """Saves frame and labels all currently visible objects."""
+class CustomFormatter(logging.Formatter):
+    """Custom format: [01-Apr-26 17:12:36.693] [INFO] [utils.tracker] [System] - Message"""
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created)
+        return dt.strftime("%d-%b-%y %H:%M:%S.%f")[:-3]
+
+    def format(self, record):
+        record.asctime = self.formatTime(record)
+        return f"[{record.asctime}] [{record.levelname}] [{record.name}] [System] - {record.getMessage()}"
+
+def setup_logging():
+    """Initialize logging into date-wise folders."""
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    log_dir = os.path.join("logs", date_str)
+    os.makedirs(log_dir, exist_ok=True)
+    
+    log_file = os.path.join(log_dir, "vehicle_detection.log")
+    
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    
+    # Clear existing handlers
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+        
+    formatter = CustomFormatter()
+    
+    # File Handler
+    fh = logging.FileHandler(log_file)
+    fh.setFormatter(formatter)
+    root_logger.addHandler(fh)
+    
+    # Console Handler
+    ch = logging.StreamHandler()
+    ch.setFormatter(formatter)
+    root_logger.addHandler(ch)
+    
+    logging.info("Logging initialized in date-wise folder.")
+
+def load_config(config_path='config.json'):
+    if not os.path.exists(config_path):
+        return {}
+    try:
+        with open(config_path, 'r') as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_training_data(frame, visible_objects, vehicle_classes, frame_count, camera_name="cam"):
+    """Saves frame and labels all currently visible objects into camera-specific folders."""
     if not visible_objects:
         return
     
     date_str = datetime.now().strftime("%Y-%m-%d")
-    base_dir = os.path.join("training", date_str)
+    base_dir = os.path.join("training", date_str, camera_name)
     img_dir = os.path.join(base_dir, "images")
     lbl_dir = os.path.join(base_dir, "labels")
     
     os.makedirs(img_dir, exist_ok=True)
     os.makedirs(lbl_dir, exist_ok=True)
     
-    # Save classes.txt if not exists
+    # Save classes.txt in the camera folder if not exists
     class_map = {cls_id: i for i, cls_id in enumerate(vehicle_classes)}
     class_names = ["car", "motorcycle", "bus", "truck"]
     classes_path = os.path.join(base_dir, "classes.txt")
@@ -34,7 +87,7 @@ def save_training_data(frame, visible_objects, vehicle_classes, frame_count):
     
     # Generate unique filename
     timestamp = datetime.now().strftime("%H%M%S_%f")
-    filename = f"train_{timestamp}"
+    filename = f"{timestamp}"
     
     # Save Image
     img_path = os.path.join(img_dir, f"{filename}.jpg")
@@ -58,107 +111,195 @@ def save_training_data(frame, visible_objects, vehicle_classes, frame_count):
             obj.saved_count += 1
             obj.last_saved_frame = frame_count
 
-def main(video_path=0):
-    # Load configuration
-    config = load_config()
+def process_camera(camera_name, video_path, config, model):
+    """Process a single camera stream in a thread with individual logging."""
+    global running
     
-    # Initialize YOLOv11 model (default to yolo11n.pt for speed)
-    model = YOLO('yolo11n.pt')
+    # Initialize individual logger for this camera
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    log_dir = os.path.join("logs", date_str)
+    os.makedirs(log_dir, exist_ok=True)
     
-    # Initialize Tracker
+    cam_logger = logging.getLogger(camera_name)
+    cam_logger.setLevel(logging.INFO)
+    cam_logger.propagate = False # don't send to root logger to avoid duplication
+    
+    # Add file handler for this camera
+    fh = logging.FileHandler(os.path.join(log_dir, f"{camera_name}.log"))
+    fh.setFormatter(CustomFormatter())
+    cam_logger.addHandler(fh)
+    
+    # Add console handler for visibility
+    ch = logging.StreamHandler()
+    ch.setFormatter(CustomFormatter())
+    cam_logger.addHandler(ch)
+
+    cam_logger.info(f"Starting camera thread on {video_path}")
+    
+    # Initialize Tracker for this specific camera
     tracker = PlateTracker(
-        max_age=config.get('TRACKER_MAX_AGE', 30),
-        iou_threshold=config.get('IOU_THRESHOLD', 0.3),
-        distance_threshold_ratio=config.get('DISTANCE_THRESHOLD_RATIO', 0.5)
+        max_age=config.get('TRACKER_MAX_AGE', 5),
+        iou_threshold=config.get('IOU_THRESHOLD', 0.5),
+        distance_threshold=config.get('DISTANCE_THRESHOLD', 300),
+        distance_scale_factor=config.get('DISTANCE_SCALE_FACTOR', 1.5)
     )
     
-    # Open Video Source
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        print(f"Error: Could not open video source {video_path}")
+        cam_logger.error(f"Error: Could not open camera (URL: {video_path})")
         return
 
-    # Define vehicle classes (COCO indices: car=2, motorcycle=3, bus=5, truck=7)
     vehicle_classes = config.get('VEHICLE_CLASSES', [2, 3, 5, 7])
     conf_threshold = config.get('CONFIDENCE_THRESHOLD', 0.45)
-
     frame_count = 0
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame_count += 1
-            
-        # 1. Detection (Only on every Nth frame for performance)
-        frame_skip = config.get("FRAME_SKIP", 1)
-        if frame_count % frame_skip == 0:
-            results = model(frame, verbose=False)[0]
-            
-            detections = []
-            cls_ids = []
-            for box in results.boxes:
-                cls = int(box.cls[0])
-                conf = float(box.conf[0])
-                
-                if cls in vehicle_classes and conf >= conf_threshold:
-                    # Get coordinates [x1, y1, x2, y2]
-                    xyxy = box.xyxy[0].cpu().numpy()
-                    detections.append(xyxy)
-                    cls_ids.append(cls)
-            
-            # 2. Update Tracker with detections
-            tracked_objects = tracker.update(detections, cls_ids)
-
-            # 2.1 Save Training Data (Triggered if any vehicle needs a sample and interval passed)
-            if config.get("Training", False):
-                sample_limit = config.get("TRAINING_SAMPLES_PER_VEHICLE", 3)
-                interval = config.get("TRAINING_FRAME_INTERVAL", 30)
-                visible_objects = [obj for obj in tracked_objects if obj.missing == 0]
-                
-                # Check if at least one visible object still needs samples AND interval has passed for it
-                needs_saving = any(
-                    obj.saved_count < sample_limit and (frame_count - obj.last_saved_frame) >= interval 
-                    for obj in visible_objects
-                )
-                
-                if needs_saving:
-                    save_training_data(frame, visible_objects, vehicle_classes, frame_count)
-        else:
-            # On skipped frames, update tracker with NO detections to maintain velocity-based prediction
-            tracked_objects = tracker.update([], [])
+    show_video = config.get("show_video", False)
+    frame_skip = config.get("FRAME_SKIP", 1)
+    
+    conf_device = config.get("device", "auto").lower()
+    if conf_device == "cuda" and torch.cuda.is_available():
+        device = "cuda"
+    elif conf_device == "cpu":
+        device = "cpu"
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         
-        # 3. Visualization (Conditional)
-        if config.get("show_video", False):
-            frame_skip = config.get("FRAME_SKIP", 1)
-            for okj in tracked_objects:
-                if okj.missing >= frame_skip:
-                    continue # Skip drawing lost IDs (allowing for frame skip)
-                    
-                color = (0, 255, 0) # Green for active
-                label = f"ID: {okj.id}"
-                
-                x1, y1, x2, y2 = map(int, okj.bbox)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    use_half = (device == "cuda")
 
-            cv2.imshow("Vehicle Tracking", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-        else:
-            # Headless mode: no imshow, but we still need a small sleep to avoid 100% CPU lock
-            # Or just let it run full speed for maximum performance.
-            # Printing status occasionally to know it's working.
-            if frame_count % 500 == 0:
-                print(f"Processed {frame_count} frames... Active tracks: {len([t for t in tracked_objects if t.missing==0])}")
+    failed_frames = 0
+    try:
+        while cap.isOpened() and running:
+            ret, frame = cap.read()
+            if not ret:
+                failed_frames += 1
+                if failed_frames >= 5:
+                    cam_logger.warning(f"Connection lost (5 failed frames). Reconnecting...")
+                    cap.release()
+                    time.sleep(2)
+                    cap = cv2.VideoCapture(video_path)
+                    failed_frames = 0
+                continue
+                
+            failed_frames = 0
+            frame_count += 1
+                
+            # 1. Detection
+            if frame_count % frame_skip == 0:
+                results = model(frame, verbose=False, half=use_half, device=device)[0]
+                
+                detections, confs, cls_ids = [], [], []
+                for box in results.boxes:
+                    cls = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    if cls in vehicle_classes and conf >= conf_threshold:
+                        detections.append(box.xyxy[0].cpu().numpy())
+                        confs.append(conf)
+                        cls_ids.append(cls)
+                
+                # 2. Update Tracker
+                tracker.update(detections, cls_ids, confs, frame)
+                
+                # Memory optimization
+                del results
+                if device == "cuda" and frame_count % 100 == 0:
+                    torch.cuda.empty_cache()
+
+                # 2.1 Save Training Data
+                if config.get("Training", False):
+                    sample_limit = config.get("TRAINING_SAMPLES_PER_VEHICLE", 3)
+                    interval = config.get("TRAINING_FRAME_INTERVAL", 30)
+                    visible_objects = [obj for obj in tracker.objects if obj.missing_frames == 0]
+                    
+                    needs_saving = any(
+                        obj.saved_count < sample_limit and (frame_count - obj.last_saved_frame) >= interval 
+                        for obj in visible_objects
+                    )
+                    
+                    if needs_saving:
+                        for obj in visible_objects:
+                            obj.bbox = obj.bboxes[-1]
+                        save_training_data(frame, visible_objects, vehicle_classes, frame_count, camera_name)
+            else:
+                tracker.update([], [], [], frame)
             
-    cap.release()
+            # 3. Handle Frames for Preview
+            if show_video:
+                vis_frame = frame.copy()
+                for okj in tracker.objects:
+                    if okj.missing_frames >= frame_skip:
+                        continue
+                    color = (0, 255, 0)
+                    x1, y1, x2, y2 = map(int, okj.bboxes[-1])
+                    cv2.rectangle(vis_frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(vis_frame, f"{camera_name} ID: {okj.obj_id}", (x1, y1 - 10), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                
+                with preview_lock:
+                    preview_frames[camera_name] = vis_frame
+            else:
+                if frame_count % 500 == 0:
+                    cam_logger.info(f"Processed {frame_count} frames... Active tracks: {len([t for t in tracker.objects if t.missing_frames==0])}")
+    except Exception as e:
+        cam_logger.error(f"Error in camera thread: {e}")
+    finally:
+        cap.release()
+        cam_logger.info("Camera thread shutting down.")
+
+def main():
+    global running
+    setup_logging()
+    config = load_config()
+    model = YOLO('yolo11n.pt')
+    
+    conf_device = config.get("device", "auto").lower()
+    if conf_device == "cuda" and torch.cuda.is_available():
+        target_device = "cuda"
+    elif conf_device == "cpu":
+        target_device = "cpu"
+    else:
+        target_device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    logging.info(f"Device configuration: {conf_device} (Effective: {target_device})")
+    if target_device == "cuda":
+        model.to("cuda")
+    
+    camera_urls = config.get("camera_url", {})
+    enabled_cameras = config.get("enabled_cameras", [])
+    
+    threads = []
+    for cam_name in enabled_cameras:
+        url = camera_urls.get(cam_name)
+        if url:
+            t = threading.Thread(target=process_camera, args=(cam_name, url, config, model), daemon=True)
+            t.start()
+            threads.append(t)
+        else:
+            logging.warning(f"Camera '{cam_name}' enabled but no URL found in config.")
+
+    show_video = config.get("show_video", False)
+    
+    try:
+        while running and any(t.is_alive() for t in threads):
+            if show_video:
+                with preview_lock:
+                    current_previews = list(preview_frames.items())
+                
+                for cam_name, frame in current_previews:
+                    cv2.imshow(f"Tracking: {cam_name}", frame)
+                
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    running = False
+                    break
+            else:
+                time.sleep(0.1)
+    except KeyboardInterrupt:
+        logging.info("Shutdown requested...")
+        running = False
+
+    logging.info("Cleaning up...")
+    running = False
+    for t in threads:
+        t.join(timeout=2)
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
-    import sys
-    # Load config first to get RTSP_URL if not provided via CLI
-    with open('config.json', 'r') as f:
-        conf_data = json.load(f)
-    
-    video_source = sys.argv[1] if len(sys.argv) > 1 else conf_data.get('RTSP_URL', 0)
-    main(video_source)
+    main()

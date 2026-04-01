@@ -1,3 +1,6 @@
 training
 note.txt
 yolo11n.pt
+logs
+utils/__pycache__
+__pycache__

@@ -10,9 +10,20 @@
         7
     ],
     "RTSP_URL": "/home/katomaran/project/ITMS/phase1/lpr/videos/test1.mp4",
+    "camera_url": {
+        "c1": "rtsp://admin:HomeG%4056789@192.168.1.2:554/live",
+        "test": "/home/katomaran/project/ITMS/phase1/lpr/videos/test1.mp4",
+        "c2": "rtsp://admin:HomeG%4056789@192.168.1.3:554/live",
+        "c3": "rtsp://admin:HomeG%4056789@192.168.1.4:554/live"
+    },
+    "enabled_cameras": [
+        "test",
+        "c1"
+    ],
     "Training": true,
     "TRAINING_SAMPLES_PER_VEHICLE": 3,
     "TRAINING_FRAME_INTERVAL": 30,
     "show_video": true,
-    "FRAME_SKIP": 2
+    "FRAME_SKIP": 3,
+    "device": "cpu"
 }

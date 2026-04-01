@@ -1,0 +1,18 @@
+{
+    "TRACKER_MAX_AGE": 30,
+    "IOU_THRESHOLD": 0.4,
+    "DISTANCE_THRESHOLD_RATIO": 0.5,
+    "CONFIDENCE_THRESHOLD": 0.45,
+    "VEHICLE_CLASSES": [
+        2,
+        3,
+        5,
+        7
+    ],
+    "RTSP_URL": "/home/katomaran/project/ITMS/phase1/lpr/videos/test1.mp4",
+    "Training": true,
+    "TRAINING_SAMPLES_PER_VEHICLE": 3,
+    "TRAINING_FRAME_INTERVAL": 30,
+    "show_video": true,
+    "FRAME_SKIP": 2
+}
